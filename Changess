@@ -1,0 +1,33 @@
+import json
+
+def generate_rotation_plan(finding):
+    prompt = f"""
+you are a security remediation expert.
+Return ONLY valid JSON.
+Create a rotation plan for the leaked secret below.
+
+Finding:
+{finding}
+
+rotation_days: {rotation_days}
+
+Required JSON schema:
+{{
+  "action": "rotate|revoke|relocate",
+  "rotation_window": "7d/14d/30d",
+  "recommended_storage": "vault|aws_secrets_manager|gcp_secret_manager|azure_key_vault",
+  "notes": "short explanation"
+}}
+    """
+
+    response = ollama.generate(model="llama2:7b",prompt = prompt)
+
+    # Extract only the JSON part
+    text = response['response'].strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        # fallback if wrapped in markdown or text
+        cleaned = text[text.find("{"):text.rfind("}")+1]
+        return json.loads(cleaned)
