@@ -1,0 +1,51 @@
+ENV_WEIGHTS = {
+    "prod": 3,
+    "production": 3,
+    "stage": 2,
+    "staging": 2,
+    "dev": 1,
+    "local": 1
+}
+
+FILE_WEIGHTS = {
+    ".env": 3,
+    ".tf": 3,
+    ".tfvars": 3,
+    ".yaml": 2,
+    ".yml": 2,
+    ".json": 2,
+    ".sh": 1,
+    ".py": 1
+}
+
+BASE_SEVERITY = {
+    "password": 3,
+    "api_key": 3,
+    "high_entropy": 3,
+    "slack_token": 1,
+    "generic": 1
+}
+
+def calculate_severity(f):
+    score = BASE_SEVERITY.get(f["type"], 1)
+
+    # environment-based detection
+    for env, weight in ENV_WEIGHTS.items():
+        if env in f["file"].lower():
+            score += weight
+
+    # file suffix weight
+    suffix = Path(f["file"]).suffix
+    score += FILE_WEIGHTS.get(suffix, 1)
+
+    # Map final numeric score to label
+    if score >= 6:
+        return "CRITICAL"
+    elif score >= 4:
+        return "HIGH"
+    elif score >= 2:
+        return "MEDIUM"
+    return "LOW"
+
+
+severity = calculate_severity(f)
