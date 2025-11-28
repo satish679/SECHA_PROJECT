@@ -1,0 +1,14 @@
+[
+    {
+        "type": "api_key",
+        "line": 4,
+        "match": "api_keys:",
+        "file": "SECHA\\app_config.yml"
+    },
+    {
+        "type": "password",
+        "line": 8,
+        "match": "password: SuperSecret123",
+        "file": "SECHA\\app_config.yml"
+    }
+]

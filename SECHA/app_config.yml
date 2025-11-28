@@ -1,0 +1,10 @@
+allowed_host:
+- localhost
+- 127.0.0.1
+api_keys:
+- AKIAOSFODNN7EXAMPLE
+- sk-test-1234567890abcdef
+database:
+  password: SuperSecret123
+  user: admin
+  

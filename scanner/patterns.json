@@ -1,0 +1,5 @@
+{
+    "password" : "(?i)(password|pwd|pass|secret).{0,3}[=:].{0,50}",
+    "api_key": "(?i)(api|token|key).{0,3}[=:].{0,50}",
+    "slack_tocken": "xox[baprs]-([0-9a-zA-Z-]{10,48})"
+}

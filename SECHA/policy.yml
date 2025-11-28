@@ -1,0 +1,4 @@
+allowed_scopes:
+- read
+- write_limited
+rotation_days: 90
