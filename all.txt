@@ -1,0 +1,127 @@
+llm -- remediation.py
+
+import json
+import yaml
+import ollama
+
+DEFAULT_SEVERITY = {
+    "password": "CRITICAL",
+    "api_key": "HIGH",
+    #"Slack_token": "MEDIUM",
+    "generic": "LOW"
+}
+
+results = json.load(open("output/results.json"))
+
+policy = yaml.safe_load(open("SECHA/policy.yml"))
+
+#llm = Ollama(model = "llama3.1")
+
+
+rotation_days = policy.get("rotation_days", 30)
+
+def generate_rotation_plan(finding):
+    prompt = f"""
+you are a security remediation expert.
+Create a JSON structured plan.
+
+Finding:
+{finding}
+
+rotation_days: {rotation_days}
+
+Return JSON with: action, rotation_window, recommended_storage, notes.
+"""
+    #response = llm.generate(prompt)
+    response = ollama.generate(model="llama2:7b",prompt = prompt)
+
+    return str(response)
+
+plan = []
+for f in results:
+    severity = DEFAULT_SEVERITY.get(f["type"], "LOW")
+    f["severity"] = severity
+    recommendation = generate_rotation_plan(f)
+    f["recommendation"] = recommendation
+    plan.append(f)
+
+with open("output/rotation_plan.json","w") as f:
+    json.dump(plan, f, indent=4)
+
+print("Rotation plan generatd in output/rotation_plan.json")
+-------------------------------------------------------------------------
+
+scanner --> patterns.json and scan.py
+
+{
+    "password" : "(?i)(password|pwd|pass|secret).{0,3}[=:].{0,50}",
+    "api_key": "(?i)(api|token|key).{0,3}[=:].{0,50}",
+    "slack_tocken": "xox[baprs]-([0-9a-zA-Z-]{10,48})"
+}
+
+----------
+import re,json, yaml
+from pathlib import Path
+
+patterns = json.load(open("scanner/patterns.json"))
+
+allowlist_data = yaml.safe_load(open("SECHA/allowlist.yml"))
+allowlist = allowlist_data.get("allow", allowlist_data.get("env_vars", []))
+
+def scan_file(file_path):
+    findings = []
+    with open(file_path, "r") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        for name, pattern in patterns.items():
+            if re.search(pattern, line):
+                if any(a in line for a in allowlist):
+                    continue
+                findings.append({
+                    "type" : name,
+                    "line" : i + 1,
+                    "match" : line.strip(),
+                    "file" : str(file_path)
+                })
+    return findings
+
+def scan_directory(target="SECHA"):
+    results = []
+    for file in Path(target).rglob("*.*"):
+        if file.suffix in [".yml",".yaml",".json",".env",".sh",".py"]:
+            results.extend(scan_file(file))
+    return results
+
+if __name__ == "__main__":
+    output = scan_directory()
+    print("scan done. finding: ")
+    print(output)
+    with open("output/results.json","w") as f:
+        json.dump(output, f, indent=4)
+--------------------------------------------------------------------------------
+
+dumpy data
+allowlist.yml
+app_config.yml
+policy.yml
+
+env_vars:
+- PATH
+- HOME
+- LANG
+-----------------------
+allowed_host:
+- localhost
+- 127.0.0.1
+api_keys:
+- AKIAOSFODNN7EXAMPLE
+- sk-test-1234567890abcdef
+database:
+  password: SuperSecret123
+  user: admin
+  
+-----------------------------
+allowed_scopes:
+- read
+- write_limited
+rotation_days: 90
