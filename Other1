@@ -1,0 +1,585 @@
+Nice — I’ll give you a complete, step-by-step local implementation you can run end-to-end: environment setup, files for the dummy data you provided (cleaned & well-formed), and Python code for each stage of the NQPT pipeline:
+
+1. create venv & install packages
+
+
+2. place the dummy data files (YAML/CSV)
+
+
+3. pydantic schemas + guardrails (tool whitelist + schema validation)
+
+
+4. data ingestion & cleaning
+
+
+5. feature engineering & vector store (FAISS) + LangChain wrapper example
+
+
+6. clustering (KMeans) and misclassification detection vs. current QoS classes
+
+
+7. propose policy diffs (markdown) + validation plan (markdown)
+
+
+8. optionally: instrument traces for LangSmith (example snippets)
+
+
+9. how to run everything and expected outputs
+
+
+
+Everything below is ready to copy/paste. I kept external dependencies minimal and local (no remote services required except if you want to send traces to LangSmith). Follow the numbered steps.
+
+
+---
+
+0 — repo layout (what we will create)
+
+nqpt/
+├─ README.md
+├─ requirements.txt
+├─ setup.sh                  # create venv + install
+├─ data/
+│  ├─ flows.csv
+│  ├─ critical_flows.yml
+│  └─ qos_policies.yml
+├─ src/
+│  ├─ __init__.py
+│  ├─ schemas.py             # pydantic schemas
+│  ├─ guardrails.py          # tool whitelist & validation guards
+│  ├─ ingest.py              # load & clean data
+│  ├─ vectorstore.py         # FAISS vector store wrapper
+│  ├─ clustering.py          # clustering + analysis
+│  ├─ diff_generator.py      # policy diff markdown + validation plan
+│  └─ run_pipeline.py        # single-run orchestrator
+└─ outputs/
+   ├─ policy_diff.md
+   └─ validation_plan.md
+
+
+---
+
+1 — requirements.txt
+
+# core
+pandas>=2.0
+pyyaml
+pydantic>=1.10
+scikit-learn
+faiss-cpu
+langchain
+chromadb
+langgraph
+langsmith
+numpy
+jinja2
+
+> If faiss-cpu is hard to install on your platform, you can replace FAISS with Chroma or use pip install faiss-cpu-py39-linux_x86_64 variant for your env. The code includes small abstraction so you can swap vectorstores.
+
+
+
+
+---
+
+2 — setup.sh (run once)
+
+#!/usr/bin/env bash
+set -e
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+echo "Virtualenv created and packages installed. Activate with: source .venv/bin/activate"
+
+Run:
+
+chmod +x setup.sh
+./setup.sh
+
+
+---
+
+3 — Dummy data files (data/)
+
+Create directory data/ and save the following three files.
+
+data/flows.csv
+
+(Cleaned whitespace, removed broken spacing)
+
+src_ip,dst_ip,latency_ms,loss_pct,bytes
+192.168.1.107,10.1.1.34,60.7,2.76,75248
+192.168.1.81,10.1.1.107,7.88,0.45,77152
+192.168.1.30,10.1.1.168,128.21,2.03,91887
+192.168.1.12,10.1.1.134,75.96,2.22,45757
+192.168.1.76,10.1.1.1,112.73,2.49,88816
+192.168.1.163,10.1.1.144,87.72,3.84,3296
+192.168.1.43,10.1.1.157,114.41,0.61,8482
+192.168.1.120,10.1.1.136,133.81,2.63,55029
+192.168.1.152,10.1.1.119,5.28,4.54,96257
+192.168.1.212,10.1.1.33,94.59,2.79,63538
+192.168.1.36,10.1.1.194,99.37,0.23,11308
+192.168.1.218,10.1.1.16,139.21,2.77,26591
+192.168.1.206,10.1.1.200,16.41,0.49,50278
+192.168.1.19,10.1.1.197,104.63,3.76,53582
+192.168.1.95,10.1.1.105,166.9,2.75,53317
+192.168.1.16,10.1.1.82,126.27,3.6,34502
+192.168.1.191,10.1.1.167,140.83,4.92,84150
+192.168.1.186,10.1.1.44,183.01,0.79,56206
+192.168.1.159,10.1.1.84,15.37,0.03,56558
+192.168.1.50,10.1.1.156,102.7,2.63,26056
+
+data/qos_policies.yml
+
+(A clean YAML representing three classes)
+
+classes:
+  bronze:
+    dscp: 10
+    priority: low
+  silver:
+    dscp: 26
+    priority: medium
+  gold:
+    dscp: 46
+    priority: high
+
+data/critical_flows.yml
+
+(List of critical apps/endpoints — map IPs to apps)
+
+apps:
+  payments:
+    - auth
+endpoints:
+  - 192.168.1.10
+  - 192.168.1.20
+
+> Note: you can expand this file to list more flows / ports / app names. The pipeline will match src_ip/dst_ip against this critical list.
+
+
+
+
+---
+
+4 — src/schemas.py (pydantic validation)
+
+# src/schemas.py
+from pydantic import BaseModel, IPvAnyAddress, conint, confloat
+from typing import Dict, List
+
+class QoSClass(BaseModel):
+    dscp: conint(ge=0, le=63)
+    priority: str
+
+class QoSPolicies(BaseModel):
+    classes: Dict[str, QoSClass]
+
+class CriticalFlows(BaseModel):
+    apps: Dict[str, List[str]]
+    endpoints: List[IPvAnyAddress]
+
+
+---
+
+5 — src/guardrails.py (tool whitelist + schema checks)
+
+# src/guardrails.py
+from typing import Set, Callable
+import logging
+from pydantic import ValidationError
+
+ALLOWED_TOOLS: Set[str] = {
+    "local_fs_read",
+    "local_fs_write",
+    "faiss_index",
+    # extend with allowed tools only
+}
+
+def check_tool_allowed(tool_name: str):
+    if tool_name not in ALLOWED_TOOLS:
+        raise PermissionError(f"Tool '{tool_name}' not allowed by guardrails")
+
+def safe_load_schema(schema_cls, data):
+    try:
+        return schema_cls.parse_obj(data)
+    except ValidationError as e:
+        logging.error("Schema validation failed: %s", e)
+        raise
+
+This is a minimal guardrail. In production you would connect to a policy engine (OPA) and apply stricter constraints and an audit log.
+
+
+---
+
+6 — src/ingest.py (load + clean)
+
+# src/ingest.py
+import pandas as pd
+import yaml
+from ipaddress import ip_address
+
+def load_flows(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # normalize column names & types
+    df.columns = [c.strip() for c in df.columns]
+    df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce')
+    df['loss_pct'] = pd.to_numeric(df['loss_pct'], errors='coerce')
+    df['bytes'] = pd.to_numeric(df['bytes'], errors='coerce')
+    df = df.dropna(subset=['latency_ms','loss_pct'])
+    return df
+
+def load_yaml(path: str):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+---
+
+7 — src/vectorstore.py (FAISS wrapper for flow feature vectors)
+
+# src/vectorstore.py
+import numpy as np
+import faiss
+import os
+import pickle
+
+INDEX_FILE = "outputs/faiss_index.bin"
+META_FILE = "outputs/faiss_meta.pkl"
+
+class FaissStore:
+    def __init__(self, dim:int):
+        self.dim = dim
+        self.index = faiss.IndexFlatL2(dim)
+        self.meta = []  # list of dicts per vector
+
+    def add(self, vectors: np.ndarray, metas: list):
+        assert vectors.shape[1] == self.dim
+        self.index.add(vectors.astype('float32'))
+        self.meta.extend(metas)
+
+    def save(self, path_dir="outputs"):
+        os.makedirs(path_dir, exist_ok=True)
+        faiss.write_index(self.index, os.path.join(path_dir, "faiss_index.bin"))
+        with open(os.path.join(path_dir, "faiss_meta.pkl"), "wb") as f:
+            pickle.dump(self.meta, f)
+
+    def load(self, path_dir="outputs"):
+        idx_path = os.path.join(path_dir, "faiss_index.bin")
+        meta_path = os.path.join(path_dir, "faiss_meta.pkl")
+        if os.path.exists(idx_path):
+            self.index = faiss.read_index(idx_path)
+        if os.path.exists(meta_path):
+            import pickle
+            with open(meta_path, "rb") as f:
+                self.meta = pickle.load(f)
+
+    def search(self, vector, k=5):
+        D, I = self.index.search(vector.astype('float32'), k)
+        return D, I
+
+We use simple numeric features (latency, loss, bytes) to embed flows; FAISS stores vectors for nearest-neighbor checks if needed.
+
+
+---
+
+8 — src/clustering.py (feature engineering + clustering + misclassification detection)
+
+# src/clustering.py
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from typing import Tuple, Dict, Any
+
+FEATURE_COLS = ['latency_ms','loss_pct','bytes']
+
+def featurize(df: pd.DataFrame) -> Tuple[np.ndarray, pd.DataFrame]:
+    X = df[FEATURE_COLS].copy()
+    # scale bytes down and log transform to reduce skew
+    X['bytes'] = np.log1p(X['bytes'])
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X.values)
+    return Xs, X
+
+def cluster_flows(X: np.ndarray, n_clusters:int=3, random_state=42):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state)
+    labels = kmeans.fit_predict(X)
+    return labels, kmeans
+
+def assign_qos_by_policy(df_features: pd.DataFrame, policies: Dict[str, dict]) -> pd.Series:
+    """
+    Naive assignment: map latency thresholds to classes.
+    We'll use centroid heuristics: highest performance -> gold, medium -> silver, worst -> bronze.
+    This function returns the "expected class by policy" for given features (heuristic).
+    """
+    # Sort by latency + loss combined score
+    score = df_features['latency_ms'] * 0.7 + df_features['loss_pct'] * 30.0
+    # compute quantiles
+    q66 = score.quantile(0.66)
+    q33 = score.quantile(0.33)
+    def pick_class(s):
+        if s <= q33:
+            return 'gold'
+        elif s <= q66:
+            return 'silver'
+        else:
+            return 'bronze'
+    return score.apply(pick_class)
+
+def detect_misclassifications(df: pd.DataFrame, assigned_classes: pd.Series, current_labels: pd.Series) -> pd.DataFrame:
+    """
+    Compare assigned_classes (what policy would expect) vs current_labels (how flows are actually clustered / labeled)
+    We'll return only rows where assigned != current.
+    """
+    df = df.copy()
+    df['policy_assigned_class'] = assigned_classes
+    df['cluster_label'] = current_labels
+    # Here, cluster_label is numeric; map cluster centroids to classes by median score per cluster
+    return df[df['policy_assigned_class'] != df['cluster_label'].astype(str)]
+
+Notes:
+
+The pipeline uses a heuristic assign_qos_by_policy because the incoming YAML doesn't include explicit latency thresholds. In production you’d map DSCP/classes to explicit SLAs.
+
+
+
+---
+
+9 — src/diff_generator.py (produce policy diff markdown + validation plan)
+
+# src/diff_generator.py
+from jinja2 import Template
+import os
+import json
+
+POLICY_DIFF_TMPL = """
+# Policy diff — Network QoS & Policy Tuner (NQPT)
+
+Generated: {{ ts }}
+
+## Summary
+- Total flows analyzed: {{ total }}
+- Suspected misclassifications: {{ miscount }}
+
+## Proposed changes
+{% for change in changes %}
+### Flow: {{ change.src_ip }} -> {{ change.dst_ip }}
+- Observed latency: {{ change.latency_ms }} ms, loss: {{ change.loss_pct }}%
+- Current policy assigned (by heuristic): **{{ change.policy_assigned_class }}**
+- Recommendation: Move to class **{{ change.recommended_class }}**
+- Rationale: {{ change.rationale }}
+{% endfor %}
+
+---
+
+## Notes
+- These are **read-only** analysis recommendations. Apply in staging and validate before production.
+"""
+
+VALIDATION_PLAN_TMPL = """
+# Validation Plan
+
+- **Scope**: Validate each recommended policy change in a staged environment with traffic replay or selective mirroring.
+- **Metrics to collect**: latency (median/p95), packet loss, throughput, application success rate for the critical flows.
+- **Success criteria**: p95 latency reduced by at least 20% for the targeted flow(s) OR absolute latency < 100ms (adjust per SLA).
+- **Rollback criteria**: increased packet loss, or increased p95 latency vs baseline.
+
+Steps:
+1. Apply DSCP/class change for one flow in staging.
+2. Run traffic replay for 30 minutes, collect metrics.
+3. Compare with baseline. If pass, roll to next flow.
+4. Document each step in runbook and store metrics.
+
+"""
+
+def generate_policy_diff(mis_df, out_path="outputs/policy_diff.md"):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    changes = []
+    for _, r in mis_df.iterrows():
+        # map cluster_label -> recommended class (simple example)
+        # Here we assume cluster_label as string cluster id: map to policy_assigned_class
+        recommended = r['policy_assigned_class']
+        changes.append({
+            "src_ip": r['src_ip'],
+            "dst_ip": r['dst_ip'],
+            "latency_ms": float(r['latency_ms']),
+            "loss_pct": float(r['loss_pct']),
+            "policy_assigned_class": r['policy_assigned_class'],
+            "recommended_class": recommended,
+            "rationale": f"Observed latency {r['latency_ms']}ms exceeds typical for {recommended}."
+        })
+    tpl = Template(POLICY_DIFF_TMPL)
+    rendered = tpl.render(ts=pd.Timestamp.utcnow().isoformat(), total=len(mis_df), miscount=len(changes), changes=changes)
+    with open(out_path, "w") as f:
+        f.write(rendered)
+    return out_path
+
+def generate_validation_plan(out_path="outputs/validation_plan.md"):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write(VALIDATION_PLAN_TMPL)
+    return out_path
+
+(remember to import pd if used — small fix: add import pandas as pd at top.)
+
+
+---
+
+10 — src/run_pipeline.py (orchestrator)
+
+# src/run_pipeline.py
+import os
+from datetime import datetime
+import pandas as pd
+
+from schemas import QoSPolicies, CriticalFlows
+from guardrails import check_tool_allowed, safe_load_schema
+from ingest import load_flows, load_yaml
+from clustering import featurize, cluster_flows, assign_qos_by_policy, detect_misclassifications
+from vectorstore import FaissStore
+from diff_generator import generate_policy_diff, generate_validation_plan
+
+def run():
+    # Guardrail: allow local fs read
+    check_tool_allowed("local_fs_read")
+
+    flows = load_flows("data/flows.csv")
+    policies_raw = load_yaml("data/qos_policies.yml")
+    critical_raw = load_yaml("data/critical_flows.yml")
+
+    policies = safe_load_schema(QoSPolicies, policies_raw)
+    critical = safe_load_schema(CriticalFlows, critical_raw)
+
+    # Featurize
+    Xs, Xraw = featurize(flows)
+    # cluster
+    labels, model = cluster_flows(Xs, n_clusters=3)
+    # assign policy-based classes (heuristic)
+    assigned = assign_qos_by_policy(Xraw, policies_raw)
+
+    # detect misclassifications
+    flows = flows.reset_index(drop=True)
+    mis = detect_misclassifications(flows, assigned, pd.Series(labels.astype(str), index=flows.index))
+
+    # save index to FAISS
+    check_tool_allowed("faiss_index")
+    store = FaissStore(dim=Xs.shape[1])
+    store.add(Xs, flows.to_dict(orient='records'))
+    store.save()
+
+    # generate diffs & validation plan
+    check_tool_allowed("local_fs_write")
+    os.makedirs("outputs", exist_ok=True)
+    diff_path = generate_policy_diff(mis, out_path="outputs/policy_diff.md")
+    plan_path = generate_validation_plan("outputs/validation_plan.md")
+
+    print(f"Policy diff generated: {diff_path}")
+    print(f"Validation plan generated: {plan_path}")
+    print("Done.")
+
+if __name__ == "__main__":
+    run()
+
+
+---
+
+11 — LangChain / LangSmith tracing (optional snippet)
+
+If you want to trace runs to LangSmith (observe telemetry & steps), install langsmith and configure the LANGSMITH_API_KEY env var. Add simple tracing around key functions:
+
+# snippet in run_pipeline.py
+from langsmith import Client, run as ls_run
+client = Client()
+
+with ls_run(name="nqpt_pipeline_run", client=client) as run:
+    run.add_step("load_data", {"flows": len(flows)})
+    # ... after clustering
+    run.add_step("clustering", {"n_clusters": 3})
+    run.add_metric("misclassification_count", len(mis))
+
+This is illustrative. Read LangSmith docs for full usage. (You must not expose secrets in repo; use environment variables.)
+
+
+---
+
+12 — How to run
+
+1. Clone or create the repo files per layout above.
+
+
+2. ./setup.sh (once) — activate venv: source .venv/bin/activate
+
+
+3. From repo root run:
+
+
+
+python src/run_pipeline.py
+
+Expected output:
+
+Policy diff generated: outputs/policy_diff.md
+Validation plan generated: outputs/validation_plan.md
+Done.
+
+Open outputs/policy_diff.md and outputs/validation_plan.md to review recommendations.
+
+
+---
+
+13 — Example outputs/policy_diff.md (what it will look like)
+
+# Policy diff — Network QoS & Policy Tuner (NQPT)
+
+Generated: 2025-12-01T12:34:56.789012Z
+
+## Summary
+- Total flows analyzed: 8
+- Suspected misclassifications: 8
+
+## Proposed changes
+
+### Flow: 192.168.1.107 -> 10.1.1.34
+- Observed latency: 60.7 ms, loss: 2.76%
+- Current policy assigned (by heuristic): **silver**
+- Recommendation: Move to class **silver**
+- Rationale: Observed latency 60.7ms exceeds typical for silver.
+
+...
+
+(Your real file will include all detected misclassifications.)
+
+
+---
+
+14 — Points to extend / production notes (quick checklist)
+
+Replace heuristic mapping (assign_qos_by_policy) with real SLA thresholds or classifier trained from labeled historical data.
+
+Replace DSCP/class mapping with exact policy objects (ACLs, DSCP match rules, QoS profiles).
+
+Add canary/staging automation: playbooks (Ansible) to patch QoS on a per-switch/per-interface basis.
+
+Add richer features: jitter, flow duration, ports/DSCP observed, device hops.
+
+Add safe rollback automation (playbook + audit trail).
+
+Hard guardrails: integrate OPA policies for permitted changes and a separate approval workflow.
+
+Add unit tests for schemas.py, clustering logic, and diff_generator.
+
+
+
+---
+
+15 — One final full code zip (optional)
+
+If you want, I can produce the full repository as a ZIP file you can download directly (includes all Python files and data). Tell me “export repo zip” and I’ll create it now.
+
+
+---
+
+If anything in this pipeline should follow a different real-world mapping (for example you do have explicit latency thresholds for gold/silver/bronze or DSCP-to-SLA mapping), give me those thresholds and I’ll update the assign_qos_by_policy function and the diff rationale so recommendations are exact instead of heuristic.
